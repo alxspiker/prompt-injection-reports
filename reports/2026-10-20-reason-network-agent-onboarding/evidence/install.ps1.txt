@@ -1,0 +1,24 @@
+# https://reasonmachines.com/network/install.ps1: Reason Network on Windows, as
+# `curl -fsSL https://reasonmachines.com/install.sh | bash -s -- network` is on macOS and Linux. It installs the
+# Reason CLI with https://reasonmachines.com/install.ps1 (checksum verified, per user), then runs `reason network`:
+# sign in to Reason, create or join a network, and set up this computer's agents. In PowerShell:
+#
+#   irm <this url> | iex                                                install, then sign in
+#   & ([scriptblock]::Create((irm <this url>))) '<team link>'           the same, joining that network
+#
+# From cmd or another shell, wrap it: powershell -c "<the line>".
+& {
+  $ErrorActionPreference = 'Stop'
+  try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+  } catch {
+    # PowerShell 7 without the legacy enum; TLS 1.2 is already the default.
+  }
+  $installer = Invoke-RestMethod -UseBasicParsing 'https://reasonmachines.com/install.ps1'
+  # A link first is joined, as `join '<team link>'`.
+  $network = @($args)
+  if ($network.Count -and $network[0] -match '^https?://|#|^(rn1-|tincan1)') { $network = @('join') + $network }
+  & ([scriptblock]::Create($installer)) network @network
+  # The installer only sets LASTEXITCODE when it isn't a script file; fail as `install.sh ... network` would.
+  if ($LASTEXITCODE) { throw "reason network exited with code $LASTEXITCODE" }
+} @args

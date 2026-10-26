@@ -1,0 +1,196 @@
+# Reason
+
+OpenAPI JSON: https://api.reasonmachines.com/v3/openapi.json
+
+> Reason is an autonomous software engineer for GitHub. Connect a repository, assign
+> issues, and Reason's cloud agents open evidence-backed pull requests (with screen
+> recordings, logs, and review-ready diffs). People drive Reason from the web app at
+> https://reasonmachines.com; programmatic per-user access is available through the HTTP API.
+
+## Public website
+
+Read the public website without authentication. HTML is the default for browsers
+and crawlers; Markdown copies are available through the links below or an explicit
+`Accept: text/markdown` request.
+
+- Complete public content: https://reasonmachines.com/llms-full.txt
+- Canonical page inventory: https://reasonmachines.com/sitemap.xml
+
+To operate a user's account or start work, use the authenticated HTTP API or
+Reason MCP described below. Do not connect to `/mcp/ara`; that old public
+transport remains retired.
+
+## HTTP API
+
+- Base URL: `https://api.reasonmachines.com`
+- Auth: `Authorization: Bearer <api_key>`
+- Create a key at https://reasonmachines.com/customize?tab=api (Settings → API).
+  A new key includes the ordinary public scopes for this walkthrough.
+- New keys use `reason_` followed by 64 hexadecimal characters.
+  Legacy `ara_` keys remain accepted.
+- Credential check: `GET /v3/self`
+- Workspace scope: use `/v3/organizations/:orgId/*`, where `:orgId` can be the
+  workspace id or slug.
+- Health: `GET https://api.reasonmachines.com/healthz`
+- All responses are JSON.
+- Rate limiting: any authenticated request may return HTTP 429 with an
+  `error.type` of `rate_limited` and a `Retry-After` header in seconds. Wait that
+  long before retrying the same request.
+- Credential reference: https://docs.reasonmachines.com/api-reference/account/verify-credentials
+- Full endpoint reference: https://docs.reasonmachines.com/api-reference
+- Report a wrong, surprising, or blocking API behavior: `POST /v3/feedback`
+  with `category` and `note` (any valid key; never include secrets).
+- Legacy public MCP (`GET`/`POST` `/mcp/ara`) returns 410. Use the new MCP below
+  or `/v3` with a Reason API key.
+
+## Public repositories
+
+- Reason Agent (usage, releases, benchmarks): https://github.com/reason-machines/reason-agent
+- Reason CLI install and setup guide: https://docs.reasonmachines.com/docs/cli
+- Reason CLI command reference: https://github.com/reason-machines/reason-cli
+- Plugins and connectors Reason can use: https://github.com/reason-machines/reason-marketplace
+- Reason plugins for Claude Code, Codex and MCP clients: https://github.com/reason-machines/reason-plugins
+
+## Reason MCP
+
+- URL: `https://mcp.reasonmachines.com/mcp` (Streamable HTTP). It is not at
+  `reasonmachines.com/mcp` or under `/v3`.
+- Full guide: https://docs.reasonmachines.com/docs/mcp
+- Sign in through your MCP client's OAuth browser flow and choose a workspace.
+  The client registers itself (dynamic client registration); no client ID or
+  secret is needed. An unauthenticated request returns 401 with a
+  `WWW-Authenticate` header; that is the start of sign-in, not a failure.
+- Without a browser: send a Reason API key as `Authorization: Bearer <key>`.
+- Claude Code: `claude mcp add --transport http reason https://mcp.reasonmachines.com/mcp`, then /mcp to authenticate.
+- Codex: `codex mcp add reason --url https://mcp.reasonmachines.com/mcp`, then `codex mcp login reason`.
+- Publisher-owned Claude and Codex plugins: https://github.com/reason-machines/reason-plugins
+- Tools follow active v3 operation IDs and the same scope and workspace checks.
+  Path/query arguments are top-level; request bodies go in `body`.
+- Start with `getSelf`, `listProjects`, or `listSessions`. Follow pagination.
+- OAuth audiences are separate: REST grants cannot be reused at MCP.
+- Downloads return authorized links. Base64 uploads are capped at 1 MiB; use REST
+  for larger files. Results are capped at 2 MiB; request smaller pages if needed.
+
+## Start and monitor a session
+
+Create a session with `POST /v3/organizations/:orgId/sessions`:
+
+```json
+{
+  "prompt": "Fix the flaky auth test, add a regression case, and open a PR.",
+  "repo": "acme/web",
+  "provider": "github",
+  "idempotency_key": "one-stable-key-per-logical-run"
+}
+```
+
+- `prompt` is required and must be non-empty.
+- `repo` and `provider` are optional. Omit them for a repository-neutral scratch
+  session; do not substitute a repository ID field.
+- `project_id` optionally targets an existing accessible Project. Discover IDs with
+  `GET /v3/organizations/:orgId/projects` using `sessions:read`. Project instructions
+  are pinned at creation; `repo` and `target` remain explicit, compatible selections.
+  Filter with `GET /v3/organizations/:orgId/sessions?project_id=<id>`.
+- `idempotency_key` is an optional JSON body field, not an HTTP header. Reuse the
+  same value when retrying the same logical create request.
+- A new create returns HTTP 201. An idempotent replay returns HTTP 200 with the
+  original session. Both return `session_id`, `url`, `status`, `session_policy`, and nullable `project_id`.
+- Poll `GET /v3/organizations/:orgId/sessions/:sessionId`. Status is `running`,
+  `exit` (execution completed), `error`, or `suspended` (cancelled/quota;
+  `suspended_reason` is `cancelled` or `quota_exhausted`, null otherwise).
+  Terminal responses may include `status`, `outcome`, `result`, `result_summary`,
+  and `pr_url`. Lifecycle status is not task success: `exit` can have outcome `failure`
+  or `action_required`. Require `outcome: success` and inspect the result; null is not success.
+  The retrieved session's nullable `pr_url` is the
+  pull or merge request URL when one exists; it is not part of the create response.
+- Terminal status fields: once `status` leaves `running`, the session carries
+  `finished_at`, `result`, `result_summary`, `outcome`, `pr_url`, `pr_title`,
+  `cost_usd`, and `usage`; failures also fill `error_class`, `reason_code`,
+  `diagnostic_message`, `failure_stage`, `failure_diagnostics`, and `root_cause`.
+- Messages: `GET /v3/organizations/:orgId/sessions/:sessionId/messages` lists the
+  conversation, cursor-paginated — pass the previous response's `end_cursor` as
+  `after`. `POST` to the same path sends a follow-up instruction.
+
+## Common endpoints
+
+```
+GET  /v3/organizations                                # list workspaces
+GET  /v3/organizations/:orgId/projects                # discover existing projects
+POST /v3/organizations/:orgId/sessions                # start a Reason session
+GET  /v3/organizations/:orgId/sessions                # list sessions
+GET  /v3/organizations/:orgId/sessions/:sessionId     # retrieve a session
+GET  /v3/organizations/:orgId/sessions/:sessionId/messages  # list messages (cursor: after)
+POST /v3/organizations/:orgId/sessions/:sessionId/messages  # send a follow-up
+GET  /v3/organizations/:orgId/repositories            # list enabled repositories
+GET  /v3/organizations/:orgId/git-plugins             # list GitHub plugins
+```
+
+## Notes
+
+- This file lives at https://reasonmachines.com/llms.txt and is the canonical machine-readable
+  entry point for agents. Read it first.
+
+## Pages
+
+Every page below is also available as clean Markdown: append `.md` to the URL, or send `Accept: text/markdown`. The entire site as one file: https://reasonmachines.com/llms-full.txt
+
+### Blog
+
+- [Reason for macOS](https://reasonmachines.com/blog/ara-for-macos.md): Run cloud sessions and let Reason work with your local files, tools, and ports.
+- [Introducing Reason Agent 1.1](https://reasonmachines.com/blog/introducing-reason-agent-1-1.md): On GPT-6 Astra, Reason Agent beats Codex on the Coding Agent Index, 65.1 against 62.5, at 22% lower cost per solved task.
+- [Introducing Reason Agent 1.0](https://reasonmachines.com/blog/reason-agent-deepswe.md): Our first results on DeepSWE v1.1. Competitive with frontier harnesses, with up to 39% lower median solving time against our benchmark baseline.
+- [Rust harness wars: grok-build vs codex](https://reasonmachines.com/blog/rust-harness-wars.md): We cloned xAI's grok-build and OpenAI's codex and read both line by line, twenty subsystems each, to see where two labs building the same coding agent actually diverge.
+- [Reason for Startups](https://reasonmachines.com/blog/yc.md): Current and alumni YC companies get $1,000 in credits to start coding. Open the Reason deal on Bookface and follow the redemption instructions to claim them.
+- [Building the software factory](https://reasonmachines.com/blog/about.md): We are building the software factory we wanted as engineers: fast enough to keep up with ideas, careful enough to trust with real repositories.
+
+### Legal
+
+- [Terms of Service](https://reasonmachines.com/terms-of-service.md): Terms governing Reason websites, applications, APIs, cloud sessions, and local-runtime controls.
+- [Privacy Policy](https://reasonmachines.com/privacy-policy.md): How Reason collects, uses, shares, retains, and deletes information.
+- [Account Deletion](https://reasonmachines.com/delete-account.md): How to request deletion of your Reason account and associated data.
+
+### Contact
+
+- [Contact](https://reasonmachines.com/contact.md): Get in touch with Reason for questions or to talk about Reason for your team.
+
+### Download
+
+- [Download](https://reasonmachines.com/download.md): Download the Reason desktop app for macOS, Windows, and Linux, or install the CLI.
+
+### Grok Bot
+
+- [Grok Bot × Reason: a software engineer for your Bot](https://reasonmachines.com/grokbot.md): Install the Reason plugin and your Grok Bot can fix bugs, build features, review pull requests and ship in your repositories, on Reason's cloud machines, while you approve.
+
+### Network
+
+- [Reason Network: let your agents talk to each other](https://reasonmachines.com/network.md): Reason Network puts every coding agent on your team on one peer-to-peer network: Grok Bot and Muse ask Claude Code, Codex and any other agent for work, and your teammates' agents join so live work doesn't collide. Free, on an open-source engine.
+
+### 简体中文
+
+- [Reason：自主软件工程师](https://reasonmachines.com/zh-hans.md): Reason 是自主 AI 软件工程师和云端编程智能体。连接 GitHub、分配问题，即可自动交付附有验证证据的拉取请求。
+- [服务条款](https://reasonmachines.com/zh-hans/terms-of-service.md): 适用于 Reason 网站、应用、API、云端会话及本地运行时控制的条款。
+- [隐私政策](https://reasonmachines.com/zh-hans/privacy-policy.md): Reason 如何收集、使用、共享、保留和删除信息。
+- [删除账户](https://reasonmachines.com/zh-hans/delete-account.md): 如何申请删除您的 Reason 账户及相关数据。
+- [联系](https://reasonmachines.com/zh-hans/contact.md): 联系 Reason，咨询问题或了解 Reason 如何助力您的团队。
+- [Reason Network：让您的智能体彼此交流](https://reasonmachines.com/zh-hans/network.md): Reason Network 将团队中的所有编程智能体连接到同一个点对点网络：Grok Bot 和 Muse 可向 Claude Code、Codex 及其他智能体请求协作，队友的智能体也能加入，避免工作冲突。基于开源引擎，免费使用。
+- [macOS 版 Reason](https://reasonmachines.com/zh-hans/blog/ara-for-macos.md): 运行云端会话，让 Reason 使用你的本地文件、工具和端口开展工作。
+- [介绍 Reason Agent 1.1](https://reasonmachines.com/zh-hans/blog/introducing-reason-agent-1-1.md): 在 GPT-6 Astra 上，Reason Agent 在 Coding Agent Index 上以 65.1 比 62.5 胜过 Codex，每个已解决任务的成本低 22%。
+- [介绍 Reason Agent 1.0](https://reasonmachines.com/zh-hans/blog/reason-agent-deepswe.md): 我们在 DeepSWE v1.1 上的首批结果已能与前沿智能体框架竞争。相较于基准对照，解题时间中位数最多降低 39%。
+- [Rust 智能体框架之争：grok-build 与 codex](https://reasonmachines.com/zh-hans/blog/rust-harness-wars.md): 我们克隆了 xAI 的 grok-build 和 OpenAI 的 codex，逐行阅读双方各二十个子系统，探究两个实验室在构建同类编程智能体时究竟有何不同。
+- [面向初创企业的 Reason](https://reasonmachines.com/zh-hans/blog/yc.md): 在读及往届 YC 公司可领取价值 1,000 美元的额度，用于开始编程。在 Bookface 打开 Reason 优惠页面，按照兑换说明领取。
+- [构建软件工厂](https://reasonmachines.com/zh-hans/blog/about.md): 我们正在构建工程师心中理想的软件工厂：快到能跟上想法，也足够严谨，值得托付真实的代码仓库。
+
+### 日本語
+
+- [Reason: 自律型ソフトウェアエンジニア](https://reasonmachines.com/ja.md): Reason は、自律型の AI ソフトウェアエンジニアであり、クラウド型のコーディングエージェントです。GitHub を接続して Issue を割り当てるだけで、検証の証跡を添えたプルリクエストを自動で提出します。
+- [利用規約](https://reasonmachines.com/ja/terms-of-service.md): Reason の Web サイト、アプリケーション、API、クラウドセッション、ローカルランタイム制御に適用される規約です。
+- [プライバシーポリシー](https://reasonmachines.com/ja/privacy-policy.md): Reason が情報をどのように収集、利用、共有、保持、削除するかについて。
+- [アカウントの削除](https://reasonmachines.com/ja/delete-account.md): Reason アカウントと関連データの削除を依頼する方法。
+- [お問い合わせ](https://reasonmachines.com/ja/contact.md): ご質問や、チームでの Reason のご利用についてのご相談は、Reason までお問い合わせください。
+- [Reason Network：エージェント同士をつなげよう](https://reasonmachines.com/ja/network.md): Reason Network は、チームのすべてのコーディングエージェントをひとつのピアツーピアネットワークにつなぎます。Grok Bot や Muse が Claude Code、Codex などのエージェントに仕事を依頼。チームメイトのエージェントも参加して、作業の競合を防ぎます。オープンソースのエンジンで無料。
+- [macOS 版 Reason](https://reasonmachines.com/ja/blog/ara-for-macos.md): クラウドセッションを実行し、Reason にローカルのファイル、ツール、ポートを扱わせられます。
+- [Reason Agent 1.1 のご紹介](https://reasonmachines.com/ja/blog/introducing-reason-agent-1-1.md): GPT-6 Astra では、Reason Agent は Coding Agent Index で Codex を 65.1 対 62.5 で上回り、解決したタスクあたりのコストは 22% 低くなります。
+- [Reason Agent 1.0 のご紹介](https://reasonmachines.com/ja/blog/reason-agent-deepswe.md): DeepSWE v1.1 での最初の結果です。フロンティアのハーネスと互角で、ベンチマークのベースラインに対し、解決時間の中央値を最大 39% 短縮しました。
+- [Rust ハーネス対決:grok-build vs codex](https://reasonmachines.com/ja/blog/rust-harness-wars.md): xAI の grok-build と OpenAI の codex をクローンし、それぞれ 20 のサブシステムを一行ずつ読み込んで、同じコーディングエージェントを作る 2 つのラボが実際にどこで分かれるのかを調べました。
+- [スタートアップ向け Reason](https://reasonmachines.com/ja/blog/yc.md): 現役およびアルムナイの YC 企業には、コーディングを始めるための $1,000 分のクレジットを提供します。Bookface で Reason のディールを開き、利用手順に従って受け取ってください。
+- [ソフトウェアファクトリーをつくる](https://reasonmachines.com/ja/blog/about.md): 私たちは、エンジニアとして欲しかったソフトウェアファクトリーをつくっています。アイデアに追いつける速さと、実際のリポジトリを任せられる慎重さを兼ね備えたものです。

@@ -1,0 +1,1291 @@
+#!/usr/bin/env bash
+
+# `curl … | sh` runs this with whatever sh is: bash on macOS, dash on Debian
+# and Ubuntu. Everything below needs bash, so a plain sh hands over to it
+# here, before reaching any syntax it cannot parse. From a pipe it fetches the
+# installer again, because sh has already read ahead in the piped copy. That
+# fetch runs without the Machine token, like every other command below.
+# macOS sh is bash in POSIX mode, which rejects or changes some bash syntax
+# (process substitution, for one). Leaving that mode here runs the rest as
+# plain bash would, since bash parses each later command only on reaching it.
+if [ -n "${BASH_VERSION:-}" ]; then
+  set +o posix
+else
+  if ! command -v bash >/dev/null 2>&1; then
+    echo "reason installer: bash is required. Install bash, then run this again." >&2
+    exit 1
+  fi
+  if [ -f "$0" ] && head -n 1 "$0" 2>/dev/null | grep -q '^#!/usr/bin/env bash$'; then
+    exec bash "$0" "$@"
+  fi
+  installer_url="${REASON_INSTALL_SCRIPT_URL:-https://reasonmachines.com/install.sh}"
+  installer="$(REASON_TOKEN= curl --connect-timeout 15 --speed-limit 1024 --speed-time 30 -fsSL "$installer_url")" && [ -n "$installer" ] || {
+    echo "reason installer: could not download $installer_url" >&2
+    exit 1
+  }
+  exec bash -c "$installer" reason-install "$@" </dev/null
+fi
+
+set -euo pipefail
+# A step that fails without printing its own error would otherwise end the
+# install with no explanation; name it. $BASH_COMMAND is the unexpanded source
+# text, so it never shows a pairing code or token.
+trap 'echo "reason installer: stopped at line $LINENO: $BASH_COMMAND" >&2' ERR
+
+# Each REASON_* input also accepts its ARA_* name, which the CLI releases,
+# servers and scripts that run this installer still set.
+release_repository="${REASON_RELEASE_REPOSITORY:-${ARA_RELEASE_REPOSITORY:-}}" # LEGACY-ARA(keep): earlier callers set ARA_RELEASE_REPOSITORY
+release_origin="https://reasonmachines.com/cli/releases"
+if [[ -n "$release_repository" ]]; then
+  release_origin="https://github.com/$release_repository/releases"
+fi
+release_origin="${REASON_RELEASE_ORIGIN:-${ARA_RELEASE_ORIGIN:-$release_origin}}" # LEGACY-ARA(keep): earlier callers set ARA_RELEASE_ORIGIN
+manifest_url_override="${REASON_CLI_MANIFEST_URL:-${ARA_CLI_MANIFEST_URL:-}}" # LEGACY-ARA(keep): earlier callers set ARA_CLI_MANIFEST_URL
+stable_manifest_url="${manifest_url_override:-https://reasonmachines.com/api/cli-manifest}"
+requested_version="${REASON_VERSION:-${ARA_VERSION:-}}" # LEGACY-ARA(keep): servers and earlier callers set ARA_VERSION
+expected_archive_sha256="${REASON_EXPECTED_ARCHIVE_SHA256:-${ARA_EXPECTED_ARCHIVE_SHA256:-}}" # LEGACY-ARA(keep): servers and earlier callers set ARA_EXPECTED_ARCHIVE_SHA256
+install_dir="${REASON_INSTALL_DIR:-${ARA_INSTALL_DIR:-${HOME}/.local/bin}}" # LEGACY-ARA(keep): installed CLIs and servers set ARA_INSTALL_DIR
+channel="production"
+# Inputs of the retired physical Device enrollment, read only to refuse it.
+# Their REASON_* names are deliberately not read: a shell that exports
+# REASON_API_KEY for the CLI must still be able to install it.
+api_key="${ARA_API_KEY:-}" # LEGACY-ARA(keep): retired enrollment one-liners pass it; refused below
+device_name="${ARA_DEVICE_NAME:-${ARA_NAME:-}}" # LEGACY-ARA(keep): retired enrollment one-liners pass it; refused below
+api_url="${ARA_API_URL:-}" # LEGACY-ARA(keep): retired enrollment one-liners pass it; refused below
+background_mode="${REASON_INSTALL_BACKGROUND_MODE:-${ARA_INSTALL_BACKGROUND_MODE:-}}" # LEGACY-ARA(keep): earlier callers set ARA_INSTALL_BACKGROUND_MODE
+foreground=false
+modify_path=true
+start_login=""
+connect_worker=false
+open_after_connect=false
+pairing_code="${REASON_CLI_PAIRING_CODE:-${ARA_CLI_PAIRING_CODE:-}}" # LEGACY-ARA(keep): earlier callers set ARA_CLI_PAIRING_CODE
+provider="${REASON_CLI_PROVIDER:-${ARA_CLI_PROVIDER:-}}" # LEGACY-ARA(keep): earlier callers set ARA_CLI_PROVIDER
+provider_account_key="${REASON_CLI_PROVIDER_ACCOUNT_KEY:-${ARA_CLI_PROVIDER_ACCOUNT_KEY:-}}" # LEGACY-ARA(keep): earlier callers set ARA_CLI_PROVIDER_ACCOUNT_KEY
+auth_mode="${REASON_CLI_AUTH_MODE:-${ARA_CLI_AUTH_MODE:-pairing}}" # LEGACY-ARA(keep): earlier callers set ARA_CLI_AUTH_MODE
+# Set by the CLI when it runs this installer to upgrade itself.
+install_upgrade="${REASON_INSTALL_UPGRADE:-${ARA_INSTALL_UPGRADE:-}}" # LEGACY-ARA(keep): installed CLIs set ARA_INSTALL_UPGRADE
+legacy_auto_update="${ARA_AUTO_UPDATE:-}" # LEGACY-ARA(keep): early CLI updaters marked their installer run with it
+preserve_auto_update="${REASON_INSTALL_PRESERVE_AUTO_UPDATE:-${ARA_INSTALL_PRESERVE_AUTO_UPDATE:-}}" # LEGACY-ARA(keep): the SSH device install command sets ARA_INSTALL_PRESERVE_AUTO_UPDATE
+installed_worker_root=""
+path_profile=""
+path_line=""
+path_added=false
+# A Machine token (rmt_…) makes this install join that Machine as a worker.
+# Hold it only in this unexported variable so nothing the installer spawns
+# (curl, tar, the CLI's own setup commands) inherits it; it is exported again
+# solely into the final `serve` exec.
+serve_token="${REASON_TOKEN:-}"
+unset REASON_TOKEN
+serve_dir=""
+serve_once=false
+serve_service=false
+[[ "${REASON_SERVICE:-}" != 1 ]] || serve_service=true
+unset REASON_SERVICE
+# Every install sets up the desktop profile unless --minimal (REASON_MINIMAL=1).
+# --desktop (REASON_DESKTOP=1), which asked for it before it was the default, still parses.
+desktop_install=true
+minimal=false
+desktop_requested=false
+[[ "${REASON_MINIMAL:-}" != 1 ]] || minimal=true
+[[ "${REASON_DESKTOP:-}" != 1 ]] || desktop_requested=true
+desktop_permissions="${REASON_PERMISSIONS:-none}"
+# REASON_DESKTOP_IN_BACKGROUND=1: the caller, which has no terminal, does not wait
+# for the desktop profile either (the Mac app's install, cli-install.ts): it installs
+# detached, as at a terminal (desktop_background below). An environment input, so an
+# older installer that does not know it installs the profile in the foreground instead.
+desktop_in_background=false
+[[ "${REASON_DESKTOP_IN_BACKGROUND:-}" != 1 ]] || desktop_in_background=true
+unset REASON_DESKTOP REASON_PERMISSIONS REASON_MINIMAL REASON_DESKTOP_IN_BACKGROUND
+# `network …` at the end: install only the CLI, then hand over to `reason network …`.
+network=false
+network_args=()
+
+usage() {
+  cat <<'EOF'
+Install Reason CLI for agent setup and automatic updates.
+
+Usage:
+  curl -fsSL https://reasonmachines.com/install | sh
+  bash install.sh [--channel production|staging] [--pair CODE [--open]] [--provider anthropic] [--auth-mode pairing|loopback] [--version VERSION] [--install-dir DIRECTORY] [--background-mode updates_only|cli_only] [--no-modify-path] [--login | --no-login]
+  curl -fsSL https://reasonmachines.com/install.sh | REASON_TOKEN=rmt_... bash [-s -- --dir PATH --once | --service]
+  curl -fsSL https://reasonmachines.com/install.sh | bash -s -- network [join '<team link>']
+  Add -s -- --minimal to either form for files, shell and terminal only, or
+  -s -- --permissions none|standard|all for macOS privacy approvals.
+
+A downloaded copy is saved without the execute bit, so run it with bash
+rather than ./install.sh.
+Homebrew is no longer supported. To switch, run `brew uninstall aradotso/tap/ara`,
+then this installer; it does not uninstall Homebrew packages itself.
+
+--version VERSION installs and activates exactly that release. It is not a
+lasting pin: the background updater (enabled unless --background-mode
+cli_only) moves it to the newest release as soon as it runs, and on macOS the
+CLI's own update check does so after 6 hours.
+
+Run from a terminal, the installer then opens Reason, which signs in when
+needed and starts a session. Pass --no-login to only install, or --login to
+only sign in with your browser instead.
+A --pair code from Reason signs in automatically and then runs `reason connect`:
+this computer becomes your own worker, kept connected in the background.
+(--pair with --provider only connects that provider.)
+--open, with --pair from a terminal, then opens Reason in that terminal.
+
+With a Machine token in REASON_TOKEN (or --token rmt_...), the installer skips
+login and then runs `reason serve` in the foreground: this computer joins the
+token's Machine as a worker. Press Ctrl+C to stop; the enrollment is kept, so
+`reason serve` reconnects later. Prefer REASON_TOKEN: a --token value is visible
+to other local processes in the installer's command line. The token reaches
+`reason serve` only through its environment and is never written to disk.
+  --dir PATH   Folder sessions work in (default: the current directory)
+  --once       Take one session, then exit
+  --service    After joining, keep the worker running as a background service
+               (macOS and Linux; also REASON_SERVICE=1): it starts again at
+               login and restarts if it fails. The token is not saved in it.
+               Stop and remove it with `reason stop NAME`.
+
+With `network` last (everything after it goes to `reason network`), the
+installer adds only the CLI: no background process and no desktop, or keeps
+an existing install's background setting, and skips the download when the
+installed CLI is already the newest release. It then runs `reason network`,
+which signs in through the browser and puts this computer on a Reason
+Network team. Reason Network's own background process then keeps the CLI up
+to date, about once a day; with --background-mode cli_only it does not.
+
+Every install then quietly runs `reason desktop install`: what a worker needs
+for a desktop, computer use and browser use. On Debian and Ubuntu it installs
+system packages only as root or with passwordless sudo. If it is not ready or
+fails, the CLI stays installed; `reason desktop install` finishes it, asking
+for your sudo password when needed, and `reason desktop status` shows the rest.
+From a terminal it runs in the background once this computer is set up, logging
+to ~/.local/share/reason/desktop-install.log.
+  --minimal    Files, shell and terminal only (also REASON_MINIMAL=1); updates
+               keep it that way until `reason desktop install`.
+  --permissions LEVEL  macOS privacy approvals (also REASON_PERMISSIONS):
+               none (default) only reports missing ones, and macOS asks at
+               first computer use; standard asks now for Accessibility and
+               Screen Recording; all asks for every one.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --version)
+      [[ $# -ge 2 ]] || { echo "reason installer: --version needs a value" >&2; exit 1; }
+      requested_version="$2"
+      shift 2
+      ;;
+    --install-dir)
+      [[ $# -ge 2 ]] || { echo "reason installer: --install-dir needs a value" >&2; exit 1; }
+      install_dir="$2"
+      shift 2
+      ;;
+    --channel)
+      [[ $# -ge 2 ]] || { echo "reason installer: --channel needs a value" >&2; exit 1; }
+      channel="$2"
+      shift 2
+      ;;
+    --pair)
+      [[ $# -ge 2 ]] || { echo "reason installer: --pair needs a value" >&2; exit 1; }
+      pairing_code="$2"
+      shift 2
+      ;;
+    --provider)
+      [[ $# -ge 2 ]] || { echo "reason installer: --provider needs a value" >&2; exit 1; }
+      provider="$2"
+      shift 2
+      ;;
+    --account-key)
+      [[ $# -ge 2 ]] || { echo "reason installer: --account-key needs a value" >&2; exit 1; }
+      provider_account_key="$2"
+      shift 2
+      ;;
+    --auth-mode)
+      [[ $# -ge 2 ]] || { echo "reason installer: --auth-mode needs a value" >&2; exit 1; }
+      auth_mode="$2"
+      shift 2
+      ;;
+    --background-mode)
+      [[ $# -ge 2 ]] || { echo "reason installer: --background-mode needs a value" >&2; exit 1; }
+      background_mode="$2"
+      shift 2
+      ;;
+    --no-modify-path)
+      modify_path=false
+      shift
+      ;;
+    --login)
+      start_login=true
+      shift
+      ;;
+    --no-login)
+      start_login=false
+      shift
+      ;;
+    --open)
+      open_after_connect=true
+      shift
+      ;;
+    --connect)
+      # What --pair does by itself since 2026-10-11; commands copied before then still carry it.
+      shift
+      ;;
+    --api-key)
+      [[ $# -ge 2 ]] || { echo "reason installer: --api-key needs a value" >&2; exit 1; }
+      api_key="$2"
+      shift 2
+      ;;
+    --name)
+      [[ $# -ge 2 ]] || { echo "reason installer: --name needs a value" >&2; exit 1; }
+      device_name="$2"
+      shift 2
+      ;;
+    --api-url)
+      [[ $# -ge 2 ]] || { echo "reason installer: --api-url needs a value" >&2; exit 1; }
+      api_url="$2"
+      shift 2
+      ;;
+    --foreground)
+      foreground=true
+      shift
+      ;;
+    --token)
+      [[ $# -ge 2 ]] || { echo "reason installer: --token needs a value" >&2; exit 1; }
+      serve_token="$2"
+      shift 2
+      ;;
+    --dir)
+      [[ $# -ge 2 ]] || { echo "reason installer: --dir needs a value" >&2; exit 1; }
+      serve_dir="$2"
+      shift 2
+      ;;
+    --once)
+      serve_once=true
+      shift
+      ;;
+    --service)
+      serve_service=true
+      shift
+      ;;
+    --desktop)
+      desktop_requested=true
+      shift
+      ;;
+    --minimal)
+      minimal=true
+      shift
+      ;;
+    --permissions)
+      [[ $# -ge 2 ]] || { echo "reason installer: --permissions needs a value" >&2; exit 1; }
+      desktop_permissions="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    network)
+      network=true
+      network_args=("${@:2}")
+      break
+      ;;
+    *)
+      echo "reason installer: unknown option: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+pinned_version="$requested_version"
+
+if [[ -n "$api_key" || -n "$device_name" || -n "$api_url" || "$foreground" == true ]]; then
+  echo "reason installer: physical Device enrollment is currently unavailable" >&2
+  exit 1
+fi
+
+network_launcher="$install_dir/reason"
+network_alias="$install_dir/ara" # LEGACY-ARA(keep): an install from before the reason layout
+network_receipt_dirs=("${XDG_CONFIG_HOME:-$HOME/.config}/reason" "${XDG_CONFIG_HOME:-$HOME/.config}/ara") # LEGACY-ARA(keep): cli/install-receipt.ts installationReceiptPath
+if [[ "$channel" == staging ]]; then
+  network_launcher="$install_dir/reason-staging"
+  network_alias="$install_dir/ara-staging" # LEGACY-ARA(keep): as above, for staging
+  network_receipt_dirs=("${network_receipt_dirs[0]}/staging" "${network_receipt_dirs[1]}/staging")
+fi
+# Whether Reason is already installed here: a launcher or an installation receipt.
+reason_installed() {
+  [[ -e "$network_launcher" || -L "$network_launcher" || -e "$network_alias" || -L "$network_alias" \
+    || -e "${network_receipt_dirs[0]}/installation.json" || -e "${network_receipt_dirs[1]}/installation.json" ]]
+}
+network_chose_mode=false
+if [[ "$network" == true ]]; then
+  if [[ -n "$serve_token" || -n "$pairing_code" || -n "$provider" || "$start_login" == true || "$open_after_connect" == true ]]; then
+    echo "reason installer: network cannot be combined with a Machine token, --pair, --provider, --login or --open" >&2
+    exit 1
+  fi
+  # `reason network` signs in itself.
+  start_login=false
+fi
+# Hands over to `reason network …` with the keyboard (see the end of this script).
+run_network() {
+  echo
+  if [[ -t 1 ]]; then exec "$1" network ${network_args[@]+"${network_args[@]}"} <&1; fi
+  exec "$1" network ${network_args[@]+"${network_args[@]}"} </dev/null
+}
+
+if [[ -n "$install_upgrade" || -n "$legacy_auto_update" ]]; then
+  background_mode="preserve"
+  start_login=false
+  # An unattended upgrade replaces the CLI only; it never starts a worker.
+  serve_token=""
+  serve_dir=""
+  serve_once=false
+  serve_service=false
+  # `reason update` brings the desktop to the new version itself (cli/upgrade.ts).
+  desktop_install=false
+  minimal=false
+  desktop_permissions="none"
+  pinned_version=""
+elif [[ "$background_mode" == "preserve" ]]; then
+  echo "reason installer: preserve is reserved for an existing Reason installation upgrade" >&2
+  exit 1
+elif [[ -z "$background_mode" && "$network" == true ]]; then
+  # The network path adds only the CLI; an existing install keeps its background
+  # setting, so cli_only never removes its updater.
+  background_mode="cli_only"
+  ! reason_installed || background_mode="preserve"
+  network_chose_mode=true
+elif [[ -z "$background_mode" ]]; then
+  background_mode="future_device"
+fi
+case "$background_mode" in
+  future_device|updates_only|cli_only|preserve) ;;
+  *) echo "reason installer: unsupported background mode: $background_mode" >&2; exit 1 ;;
+esac
+case "$desktop_permissions" in
+  none|standard|all) ;;
+  *) echo "reason installer: --permissions must be none, standard or all" >&2; exit 1 ;;
+esac
+if [[ "$minimal" == true && "$desktop_requested" == true ]]; then
+  echo "reason installer: --minimal installs no desktop; drop --desktop (REASON_DESKTOP)" >&2
+  exit 1
+fi
+if [[ "$minimal" == true && "$desktop_permissions" != none ]]; then
+  echo "reason installer: --permissions is for the desktop, which --minimal skips" >&2
+  exit 1
+fi
+[[ "$minimal" != true ]] || desktop_install=false
+[[ "$network" != true ]] || desktop_install=false
+# SSH-owned installs (apps/server/src/ssh-devices) run in a private installer HOME, not the
+# HOME their worker reads its desktop from; the SSH updater installs that one.
+[[ "$preserve_auto_update" != 1 ]] || desktop_install=false
+# A person at a terminal does not wait for the desktop profile (about 325 MB on a
+# Mac): once this computer is signed in and connected it installs in the
+# background, and the worker restarts to serve it when no Session runs
+# (REASON_DESKTOP_BACKGROUND, cli/desktop-cli.ts). Scripts and --permissions
+# standard|all keep installing it before the installer ends.
+desktop_background=false
+if [[ "$desktop_install" == true && "$desktop_permissions" == none && -z "$serve_token" && ( -t 1 || "$desktop_in_background" == true ) ]]; then
+  desktop_background=true
+fi
+case "$channel" in
+  production|staging) ;;
+  *) echo "reason installer: unsupported channel: $channel" >&2; exit 1 ;;
+esac
+case "$auth_mode" in
+  pairing|loopback) ;;
+  *) echo "reason installer: unsupported auth mode: $auth_mode" >&2; exit 1 ;;
+esac
+if [[ "$auth_mode" == "loopback" && -n "$pairing_code" ]]; then
+  echo "reason installer: --pair cannot be combined with --auth-mode loopback" >&2
+  exit 1
+fi
+if [[ -n "$provider" && "$provider" != "anthropic" ]]; then
+  echo "reason installer: unsupported provider: $provider" >&2
+  exit 1
+fi
+if [[ -n "$provider" && -z "$pairing_code" ]]; then
+  echo "reason installer: --provider requires --pair from Reason" >&2
+  exit 1
+fi
+# A pairing code from Reason sets this computer up whole: signed in, then connected.
+if [[ -n "$pairing_code" && -z "$provider" ]]; then connect_worker=true; fi
+if [[ "$open_after_connect" == true && "$connect_worker" != true ]]; then
+  echo "reason installer: --open needs --pair from Reason, without --provider" >&2
+  exit 1
+fi
+if [[ -n "$provider_account_key" && -z "$provider" ]]; then
+  echo "reason installer: --account-key requires --provider" >&2
+  exit 1
+fi
+# Signing in is opt-in (--login); a pairing code from Reason's web app asks for it.
+# With no sign-in choice made, an install from a terminal opens Reason when it
+# finishes. A pairing code, a Machine token, --login, --no-login and an
+# unattended upgrade each decide for themselves.
+open_reason=false
+if [[ -z "$start_login" ]]; then
+  if [[ -n "$pairing_code" ]]; then start_login=true; else start_login=false; open_reason=true; fi
+fi
+if [[ -n "$serve_token" ]]; then
+  # Never echo the value itself.
+  [[ "$serve_token" == rmt_* ]] || {
+    echo "reason installer: REASON_TOKEN/--token must be a Machine token (rmt_...)" >&2
+    exit 1
+  }
+  if [[ -n "$pairing_code" || -n "$provider" ]]; then
+    echo "reason installer: a Machine token cannot be combined with --pair or --provider" >&2
+    exit 1
+  fi
+  if [[ "$serve_service" == true && "$serve_once" == true ]]; then
+    echo "reason installer: --service cannot be combined with --once" >&2
+    exit 1
+  fi
+  if [[ -n "$serve_dir" ]]; then
+    [[ -d "$serve_dir" ]] || { echo "reason installer: --dir is not a directory: $serve_dir" >&2; exit 1; }
+    serve_dir="$(cd "$serve_dir" && pwd -P)"
+  fi
+  start_login=false
+elif [[ -n "$serve_dir" || "$serve_once" == true || "$serve_service" == true ]]; then
+  echo "reason installer: --dir, --once and --service need a Machine token (REASON_TOKEN or --token)" >&2
+  exit 1
+fi
+if [[ "$channel" == "staging" ]]; then
+  [[ -z "$requested_version" ]] || {
+    echo "reason installer: staging installs resolve an immutable staging manifest; omit --version." >&2
+    exit 1
+  }
+  stable_manifest_url="${manifest_url_override:-https://staging.reasonmachines.com/api/cli-manifest?channel=staging}"
+fi
+
+case "$(uname -s)" in
+  Darwin) os="darwin" ;;
+  Linux) os="linux" ;;
+  *)
+    echo "reason installer: this installer is for macOS and Linux" >&2
+    # Agents on Windows (Claude Code runs Git Bash) land here.
+    if [[ "$network" == true ]]; then
+      echo "On Windows, run in PowerShell: irm https://reasonmachines.com/network/install.ps1 | iex" >&2
+    else
+      echo "On Windows, run in PowerShell: irm https://reasonmachines.com/install.ps1 | iex" >&2
+    fi
+    exit 1
+    ;;
+esac
+
+case "$(uname -m)" in
+  arm64|aarch64) arch="arm64" ;;
+  x86_64|amd64) arch="x64" ;;
+  *)
+    echo "reason installer: unsupported architecture: $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+libc=""
+if [[ "$os" == "linux" ]]; then
+  # Ubuntu build images can also have musl installed for cross-compilation.
+  # Prefer the active libc; a spare musl loader does not make the host Alpine.
+  ldd_version="$(ldd --version 2>&1 || true)"
+  if printf '%s' "$ldd_version" | grep -qi musl; then
+    libc="-musl"
+  elif printf '%s' "$ldd_version" | grep -Eqi 'glibc|GNU libc|GNU C Library'; then
+    libc=""
+  elif getconf GNU_LIBC_VERSION >/dev/null 2>&1; then
+    libc=""
+  elif compgen -G "/lib/ld-musl-*.so.1" >/dev/null; then
+    libc="-musl"
+  fi
+fi
+
+if [[ -z "$requested_version" ]]; then
+  manifest_url="$stable_manifest_url"
+else
+  manifest_url="$release_origin/download/cli-v$requested_version/manifest.json"
+fi
+
+# Without these a stalled connection never errors, so --retry never runs and the
+# install hangs silently (the Mac app waited 7 minutes on one, 2026-10-13).
+curl_stall_limits=(--connect-timeout 15 --speed-limit 1024 --speed-time 30)
+manifest="$(curl "${curl_stall_limits[@]}" --retry 5 --retry-all-errors -fsSL "$manifest_url")"
+# Select the first match but drain input so metadata producers cannot SIGPIPE
+# under pipefail when manifests or checksum lists exceed the pipe buffer.
+manifest_version="$(printf '%s' "$manifest" \
+  | grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' \
+  | sed -n '1p' \
+  | cut -d'"' -f4)"
+manifest_tag="$(printf '%s' "$manifest" \
+  | grep -o '"tag"[[:space:]]*:[[:space:]]*"[^"]*"' \
+  | sed -n '1p' \
+  | cut -d'"' -f4)"
+if [[ -z "$requested_version" ]]; then
+  requested_version="$manifest_version"
+elif [[ "$manifest_version" != "$requested_version" ]]; then
+  echo "reason installer: release manifest version mismatch" >&2
+  exit 1
+fi
+
+if [[ ! "$requested_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+  echo "reason installer: invalid release version: ${requested_version:-missing}" >&2
+  exit 1
+fi
+if [[ "$channel" == "production" ]]; then
+  [[ "$manifest_tag" == "cli-v$requested_version" ]] || {
+    echo "reason installer: production manifest tag does not match its version" >&2
+    exit 1
+  }
+else
+  staging_prefix="cli-staging-v${requested_version}-"
+  [[ "$manifest_tag" == "$staging_prefix"* ]] || {
+    echo "reason installer: staging manifest did not return an immutable staging release" >&2
+    exit 1
+  }
+  staging_revision="${manifest_tag#"$staging_prefix"}"
+  [[ "$staging_revision" =~ ^[0-9a-f]{7,64}$ ]] || {
+    echo "reason installer: staging manifest release revision is invalid" >&2
+    exit 1
+  }
+fi
+
+# A network install on a computer that already runs this release skips the
+# download, unless it was asked for a channel or background mode of its own.
+if [[ "$network" == true && "$network_chose_mode" == true && "$channel" == production && -x "$network_launcher" ]] \
+  && [[ "$("$network_launcher" --version </dev/null 2>/dev/null || true)" == "$requested_version" ]]; then
+  echo "Reason $requested_version is already installed."
+  run_network "$network_launcher"
+fi
+
+target="${os}-${arch}${libc}"
+archive_name="reason-machines-cli-$target-$requested_version.tgz"
+release_tag="${manifest_tag:-cli-v$requested_version}"
+asset_origin="$release_origin/download/$release_tag"
+temporary_dir="$(mktemp -d)"
+staged_worker_dir=""
+staged_link=""
+installed_identity_source=""
+identity_stage=""
+identity_backup=""
+cleanup() {
+  rm -rf "$temporary_dir"
+  if [[ -n "$staged_worker_dir" ]]; then
+    rm -rf "$staged_worker_dir"
+  fi
+  if [[ -n "$staged_link" ]]; then
+    rm -f "$staged_link"
+  fi
+  if [[ -n "$identity_stage" ]]; then
+    rm -rf "$identity_stage"
+  fi
+  if [[ -n "$identity_backup" ]]; then
+    rm -rf "$identity_backup"
+  fi
+}
+trap cleanup EXIT
+
+channel_label=""
+[[ "$channel" == production ]] || channel_label=" ($channel)"
+echo "Installing Reason ${requested_version}${channel_label}…"
+checksums="$(curl "${curl_stall_limits[@]}" --retry 5 --retry-all-errors -fsSL "$asset_origin/SHA256SUMS")"
+expected_sha256="$(printf '%s\n' "$checksums" \
+  | awk -v archive="$archive_name" '$2 == archive && !found { print $1; found=1 }')"
+if [[ ! "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]; then
+  archive_name="ara-so-cli-$target-$requested_version.tgz"
+  expected_sha256="$(printf '%s\n' "$checksums" \
+    | awk -v archive="$archive_name" '$2 == archive && !found { print $1; found=1 }')"
+fi
+[[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "reason installer: release returned no usable checksum for $target" >&2
+  exit 1
+}
+if [[ -n "$expected_archive_sha256" ]]; then
+  [[ "$expected_archive_sha256" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "reason installer: invalid expected archive checksum" >&2
+    exit 1
+  }
+  [[ "$expected_sha256" == "$expected_archive_sha256" ]] || {
+    echo "reason installer: release checksum does not match the pinned checksum" >&2
+    exit 1
+  }
+fi
+
+archive="$temporary_dir/ara.tgz"
+# curl's own --retry never repeats a failed write to the archive file
+# (curl: (23)), so try the whole download again before giving up.
+download_attempt=1
+until curl "${curl_stall_limits[@]}" --retry 5 --retry-all-errors -fsSL "$asset_origin/$archive_name" -o "$archive"; do
+  rm -f "$archive"
+  if (( download_attempt >= 3 )); then
+    echo "reason installer: could not download $archive_name. Check your connection and free disk space in ${TMPDIR:-/tmp}, then run this again." >&2
+    exit 1
+  fi
+  download_attempt=$((download_attempt + 1))
+  echo "Retrying the Reason download ($download_attempt of 3)…" >&2
+done
+if command -v sha256sum >/dev/null 2>&1; then
+  actual_sha256="$(sha256sum "$archive" | awk '{print $1}')"
+elif command -v shasum >/dev/null 2>&1; then
+  actual_sha256="$(shasum -a 256 "$archive" | awk '{print $1}')"
+elif command -v openssl >/dev/null 2>&1; then
+  actual_sha256="$(openssl dgst -sha256 "$archive" | awk '{print $NF}')"
+else
+  echo "reason installer: sha256sum, shasum, or openssl is required" >&2
+  exit 1
+fi
+[[ "$actual_sha256" == "$expected_sha256" ]] || {
+  echo "reason installer: SHA-256 checksum mismatch" >&2
+  exit 1
+}
+
+tar -xzf "$archive" -C "$temporary_dir"
+# Packages name the executable bin/reason; releases from before the rename,
+# still installable with --version, bin/ara. Either installs as the worker's
+# ara until the launcher flips.
+packaged_executable="$temporary_dir/package/bin/reason"
+[[ -f "$packaged_executable" ]] || packaged_executable="$temporary_dir/package/bin/ara"
+[[ -f "$packaged_executable" ]] || {
+  echo "reason installer: package is missing its executable" >&2
+  exit 1
+}
+# Likewise its macOS credential library, installed under the name it has,
+# which the executable looks for beside itself (cli/local-device-credential-contract.ts).
+credential_library_name="libreason_device_keychain.dylib"
+[[ -s "$temporary_dir/package/bin/$credential_library_name" ]] || credential_library_name="libara_device_keychain.dylib"
+if [[ "$os" == "darwin" ]]; then
+  xattr -cr "$temporary_dir" 2>/dev/null || true
+  xattr -dr com.apple.quarantine "$temporary_dir" 2>/dev/null || true
+  # Beside the executable at the path its release reads it from
+  # (cli/macos-background-identity.ts); releases before the rename, still
+  # installable with --version, carry bin/Ara.app (legacy layout).
+  packaged_identity_path="Background/Reason.app"
+  if [[ ! -d "$temporary_dir/package/bin/$packaged_identity_path" ]]; then
+    packaged_identity_path="Ara.app"
+  fi
+  packaged_identity="$temporary_dir/package/bin/$packaged_identity_path"
+  [[ -d "$packaged_identity" ]] || {
+    echo "reason installer: macOS package is missing its Reason background identity" >&2
+    exit 1
+  }
+  /usr/bin/codesign --verify --strict "$packaged_identity" || {
+    echo "reason installer: Reason background identity signature is invalid" >&2
+    exit 1
+  }
+  # so.ara.cli, or the com.reasonmachines.cli a later release names it
+  # (cli/macos-background-identity.ts MACOS_BACKGROUND_IDENTITY_BUNDLE_IDS).
+  packaged_identity_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$packaged_identity/Contents/Info.plist")"
+  [[ "$packaged_identity_id" == "so.ara.cli" || "$packaged_identity_id" == "com.reasonmachines.cli" ]] || {
+    echo "reason installer: Reason background identity has the wrong bundle identifier" >&2
+    exit 1
+  }
+  # Packages since the Reason rebrand name it "Reason"; older --version installs keep "Ara".
+  identity_name="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$packaged_identity/Contents/Info.plist")"
+  [[ "$identity_name" == "Reason" || "$identity_name" == "Ara" ]] || {
+    echo "reason installer: Reason background identity has the wrong display name" >&2
+    exit 1
+  }
+fi
+
+copy_packaged_runtime() {
+  if [[ -d "$temporary_dir/package/bin/runtime" ]]; then
+    cp -Rp "$temporary_dir/package/bin/runtime" "$staged_worker_dir/runtime"
+  fi
+}
+
+mkdir -p "$install_dir"
+install_dir="$(cd "$install_dir" && pwd -P)"
+
+# The launcher's two names (cli/install-receipt.ts installerLauncherNames).
+# Releases from 0.2.394 read the reason layout (#25580): `reason` runs
+# .reason-worker-<version>-<target>.XXXXXX/reason and `ara` links to it. An
+# older release, which --version or the Mac app's carried release may still
+# install, keeps the ara layout: `ara` runs .ara-worker-…/ara and `reason`
+# links to it. On macOS those releases refuse to start from a .reason-worker root.
+reason_name="reason"
+ara_name="ara" # LEGACY-ARA(keep): the ara layout's launcher, and the reason layout's link to it
+if [[ "$channel" == "staging" ]]; then
+  reason_name="reason-staging"
+  ara_name="ara-staging" # LEGACY-ARA(keep): as above, for staging
+fi
+release_reads_reason_layout() {
+  [[ "$requested_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-.+)?$ ]] || return 1
+  local major=$((10#${BASH_REMATCH[1]})) minor=$((10#${BASH_REMATCH[2]})) patch=$((10#${BASH_REMATCH[3]}))
+  local prerelease="${BASH_REMATCH[4]}"
+  if (( major != 0 )); then (( major > 0 ))
+  elif (( minor != 2 )); then (( minor > 2 ))
+  elif (( patch != 394 )); then (( patch > 394 ))
+  else [[ -z "$prerelease" ]]
+  fi
+}
+# Whether this installer may replace NAME in the install folder: absent, the
+# link to `ara`, a link to one of its worker roots here or to the managed
+# runtime (cli/managed-runtime.ts), or the staging wrapper it writes. A
+# `reason` from pipx, npm or the user stays theirs.
+installer_owns_name() {
+  local path="$install_dir/$1" target first_line=""
+  [[ -e "$path" || -L "$path" ]] || return 0
+  if [[ -L "$path" ]]; then
+    target="$(readlink "$path")"
+    [[ "$target" == /* ]] || target="$install_dir/$target"
+    case "$target" in
+      "$install_dir/$ara_name" \
+        | "$install_dir"/.ara-worker-*/ara | "$install_dir"/.reason-worker-*/reason \
+        | "${HOME:-/nonexistent}/Library/Application Support/Reason/CLI/current" \
+        | "${HOME:-/nonexistent}/Library/Application Support/Reason Staging/CLI/current" \
+        | "${HOME:-/nonexistent}/Library/Application Support/Ara/runtime/current" \
+        | "${HOME:-/nonexistent}/Library/Application Support/Ara/staging/runtime/current") return 0 ;;
+    esac
+    return 1
+  fi
+  [[ "$channel" == "staging" && -f "$path" ]] || return 1
+  IFS= read -r first_line <"$path" || true
+  [[ "$first_line" == "#!"* ]] && grep -Fqx "export REASON_CLI_CHANNEL=staging ARA_CLI_CHANNEL=staging" "$path"
+}
+launcher_name="$ara_name"
+worker_name="ara"
+worker_prefix=".ara" # LEGACY-ARA(keep): worker roots of releases before 0.2.394
+if release_reads_reason_layout && installer_owns_name "$reason_name"; then
+  launcher_name="$reason_name"
+  worker_name="reason"
+  worker_prefix=".reason"
+fi
+command_path="$install_dir/$launcher_name"
+# This channel's worker roots: production .ara-worker-*/.reason-worker-*,
+# staging .ara-staging-worker-*/.reason-staging-worker-*.
+worker_root_infix="worker"
+[[ "$channel" == "staging" ]] && worker_root_infix="staging-worker"
+# The worker roots the channel's launchers run now: a link's target folder, or
+# the folder a staging wrapper script names.
+launcher_worker_roots() {
+  local name path target root
+  for name in "$reason_name" "$ara_name"; do
+    path="$install_dir/$name"
+    if [[ -L "$path" ]]; then
+      target="$(readlink "$path")"
+      [[ "$target" == /* ]] || target="$install_dir/$target"
+      root="$(dirname "$target")"
+      [[ "$(dirname "$root")" == "$install_dir" ]] && printf '%s\n' "$root"
+    elif [[ -f "$path" ]]; then
+      for root in "$install_dir"/.ara-"$worker_root_infix"-* "$install_dir"/.reason-"$worker_root_infix"-*; do
+        [[ -d "$root" ]] && grep -qsF "$root/" "$path" && printf '%s\n' "$root"
+      done
+    fi
+  done
+  return 0
+}
+# The release this install replaces stays one update, as cli/managed-runtime.ts
+# keeps `previous`: `reason update` itself runs from it while this script runs.
+previous_worker_roots="$(launcher_worker_roots)"
+
+if [[ "$channel" == "staging" ]]; then
+  staged_worker_dir="$(mktemp -d "$install_dir/$worker_prefix-staging-worker-$requested_version-$target.XXXXXX")"
+  chmod 0755 "$staged_worker_dir"
+  install -m 0755 "$packaged_executable" "$staged_worker_dir/$worker_name"
+  copy_packaged_runtime
+  if [[ "$os" == "darwin" ]]; then
+    credential_library="$temporary_dir/package/bin/$credential_library_name"
+    [[ -s "$credential_library" ]] || {
+      echo "reason installer: macOS worker package is missing its credential library" >&2
+      exit 1
+    }
+    install -m 0755 "$credential_library" \
+      "$staged_worker_dir/$credential_library_name"
+    /usr/bin/ditto "$packaged_identity" "$staged_worker_dir/$packaged_identity_path"
+    installed_identity_source="$staged_worker_dir/$packaged_identity_path"
+    xattr -cr "$staged_worker_dir" 2>/dev/null || true
+    xattr -dr com.apple.quarantine "$staged_worker_dir" 2>/dev/null || true
+  fi
+  staged_link="$install_dir/$worker_prefix-staging-link.$$"
+  # The launcher may later run an older or newer CLI, so it exports both names.
+  printf '#!/usr/bin/env bash\nexport REASON_CLI_CHANNEL=staging ARA_CLI_CHANNEL=staging\nexport REASON_CLI_LAUNCHER_PATH=%q ARA_CLI_LAUNCHER_PATH=%q\nexport REASON_MANAGED_RUNTIME_ROOT=%q ARA_MANAGED_RUNTIME_ROOT=%q\nexec %q "$@"\n' \
+    "$command_path" "$command_path" \
+    "$staged_worker_dir/runtime" "$staged_worker_dir/runtime" \
+    "$staged_worker_dir/$worker_name" > "$staged_link" # LEGACY-ARA(keep): CLIs before REASON_* read only the ARA_* names
+  chmod 0755 "$staged_link"
+  mv -f "$staged_link" "$command_path"
+  installed_worker_root="$staged_worker_dir"
+  staged_link=""
+  staged_worker_dir=""
+elif [[ "$os" == "darwin" ]]; then
+  credential_library="$temporary_dir/package/bin/$credential_library_name"
+  [[ -s "$credential_library" ]] || {
+    echo "reason installer: macOS worker package is missing its credential library" >&2
+    exit 1
+  }
+  staged_worker_dir="$(mktemp -d "$install_dir/$worker_prefix-worker-$requested_version-$target.XXXXXX")"
+  chmod 0755 "$staged_worker_dir"
+  install -m 0755 "$packaged_executable" "$staged_worker_dir/$worker_name"
+  copy_packaged_runtime
+  install -m 0755 "$credential_library" \
+    "$staged_worker_dir/$credential_library_name"
+  /usr/bin/ditto "$packaged_identity" "$staged_worker_dir/$packaged_identity_path"
+  installed_identity_source="$staged_worker_dir/$packaged_identity_path"
+  xattr -cr "$staged_worker_dir" 2>/dev/null || true
+  xattr -dr com.apple.quarantine "$staged_worker_dir" 2>/dev/null || true
+  staged_link="$install_dir/$worker_prefix-worker-link.$$"
+  ln -s "$staged_worker_dir/$worker_name" "$staged_link"
+  mv -f "$staged_link" "$command_path"
+  installed_worker_root="$staged_worker_dir"
+  staged_link=""
+  staged_worker_dir=""
+else
+  staged_worker_dir="$(mktemp -d "$install_dir/$worker_prefix-worker-$requested_version-$target.XXXXXX")"
+  chmod 0755 "$staged_worker_dir"
+  install -m 0755 "$packaged_executable" "$staged_worker_dir/$worker_name"
+  copy_packaged_runtime
+  staged_link="$install_dir/$worker_prefix-worker-link.$$"
+  ln -s "$staged_worker_dir/$worker_name" "$staged_link"
+  mv -f "$staged_link" "$command_path"
+  installed_worker_root="$staged_worker_dir"
+  staged_link=""
+  staged_worker_dir=""
+fi
+if [[ "$os" == "darwin" ]]; then
+  xattr -cr "$install_dir" 2>/dev/null || true
+  xattr -dr com.apple.quarantine "$install_dir" 2>/dev/null || true
+fi
+created_alias_path=""
+if [[ "$launcher_name" == "$reason_name" ]]; then
+  # `ara` links to `reason`, replaced only now that `reason` runs this release:
+  # the other order would briefly make `reason` -> `ara` -> `reason` a loop.
+  # Relative, as the SSH device checks and cli/managed-runtime.ts compare it.
+  # Services, updaters and SSH units written to run `ara` keep running, and an
+  # earlier CLI that ran this installer to update checks `ara --version`.
+  # LEGACY-ARA(after: 2026-11-15): HIGH RISK — delete the ara -> reason link only once no CLI older than 0.2.394 reports (installation telemetry), every SSH device unit and update.sh run bin/reason (apps/server/src/ssh-devices), and services written to run ara have been rewritten; deleting it earlier silently stops auto-update on computers whose updater runs …/ara.
+  staged_link="$install_dir/.reason-link.$$"
+  ln -s "$reason_name" "$staged_link"
+  mv -f "$staged_link" "$install_dir/$ara_name"
+  staged_link=""
+elif ! [[ -L "$install_dir/$reason_name" && "$(readlink "$install_dir/$reason_name")" == "$ara_name" ]] \
+  && installer_owns_name "$reason_name"; then
+  # The ara layout: `reason` links to `ara`. An earlier release installed over
+  # the reason layout turns the installer's `reason` back into that link.
+  staged_link="$install_dir/.ara-link.$$" # LEGACY-ARA(keep): the ara layout's alias
+  ln -s "$ara_name" "$staged_link"
+  mv -f "$staged_link" "$install_dir/$reason_name"
+  staged_link=""
+  created_alias_path="$install_dir/$reason_name"
+fi
+# Two overlapping installs, one pinned below 0.2.394, can each swap one name
+# last and leave `reason` and `ara` linked to each other. Every run checks after
+# its own swaps, so the one that finishes last points its launcher back at its
+# own worker. Production only: a staging launcher is the wrapper script, which
+# a link would replace; staging installs are staff-only and rerun by hand.
+if [[ "$channel" != "staging" && -L "$install_dir/$reason_name" && -L "$install_dir/$ara_name" \
+  && "$(readlink "$install_dir/$reason_name")" == "$ara_name" \
+  && "$(readlink "$install_dir/$ara_name")" == "$reason_name" ]]; then
+  staged_link="$install_dir/.reason-loop-link.$$"
+  ln -s "$installed_worker_root/$worker_name" "$staged_link"
+  mv -f "$staged_link" "$command_path"
+  staged_link=""
+fi
+# Every install writes a new ~70 MB worker root and nothing removed the old
+# ones, so a computer on the release train collected gigabytes. Deletes this
+# channel's roots other than the new one, the one this install replaced, any a
+# launcher still runs, any a live process runs from (it opens the credential
+# library beside its executable later), and any younger than an hour (an
+# overlapping install's, not yet linked). Best effort: a root that stays is
+# removed by the next install.
+prune_worker_roots() {
+  local running keep root
+  local mapped status
+  running="$(ps -A -w -w -o args= 2>/dev/null)" || return 0
+  # Arguments name the path a process started by: for one started through the
+  # launcher link, the link, not the root. Linux's /proc and macOS's lsof name
+  # the real executables (and libraries) mapped; without them, nothing goes.
+  if [[ -d /proc/self ]]; then
+    running+=$'\n'"$(for exe in /proc/[0-9]*/exe; do readlink "$exe" 2>/dev/null || true; done)"
+  elif [[ -x /usr/sbin/lsof ]]; then
+    # Exits 1 when some processes are not readable; the user's own always are.
+    status=0
+    mapped="$(/usr/sbin/lsof -nP -w -d txt -Fn 2>/dev/null)" || status=$?
+    [[ ( "$status" == 0 || "$status" == 1 ) && -n "$mapped" ]] || return 0
+    running+=$'\n'"$mapped"
+  else
+    return 0
+  fi
+  keep="$installed_worker_root"$'\n'"$previous_worker_roots"$'\n'"$(launcher_worker_roots)"
+  while IFS= read -r root; do
+    [[ -n "$root" ]] || continue
+    grep -qxF "$root" <<<"$keep" && continue
+    grep -qF "$root/" <<<"$running" && continue
+    rm -rf "$root" 2>/dev/null || true
+  done <<<"$(find "$install_dir" -mindepth 1 -maxdepth 1 -type d \
+    \( -name ".ara-$worker_root_infix-*" -o -name ".reason-$worker_root_infix-*" \) -mmin +60 2>/dev/null)"
+  return 0
+}
+prune_worker_roots
+# User-facing hints name `reason` when it runs this install; an unrelated
+# existing `reason` keeps the hints on the installed launcher.
+display_path="$command_path"
+if [[ -L "$install_dir/$reason_name" && "$(readlink "$install_dir/$reason_name")" == "$ara_name" ]]; then
+  display_path="$install_dir/$reason_name"
+fi
+
+# A legacy launch agent without an associated app is presented by macOS using
+# its Developer ID certificate holder. Install and register this signed,
+# GUI-less bundle before launchctl sees either Reason agent, so the system-owned
+# alert and Login Items row identify the responsible product simply as "Reason".
+# Finder and Privacy & Security name it by its folder, so it installs as
+# Reason.app (cli/macos-background-identity.ts).
+if [[ "$os" == "darwin" && "$background_mode" != "cli_only" ]]; then
+  [[ -d "$installed_identity_source" ]] || {
+    echo "reason installer: installed Reason background identity is unavailable" >&2
+    exit 1
+  }
+  identity_parent="$HOME/Library/Application Support/Reason/Background"
+  identity_destination="$identity_parent/Reason.app"
+  mkdir -p "$identity_parent"
+  chmod 0700 "$identity_parent"
+  identity_stage="$identity_parent/.Reason.app.$$.tmp"
+  identity_backup="$identity_parent/.Reason.app.$$.old"
+  rm -rf "$identity_stage" "$identity_backup"
+  /usr/bin/ditto "$installed_identity_source" "$identity_stage"
+  /usr/bin/codesign --verify --strict "$identity_stage"
+  if [[ -e "$identity_destination" ]]; then
+    [[ -d "$identity_destination" && -f "$identity_destination/Contents/Info.plist" ]] || {
+      echo "reason installer: refusing to replace a non-Reason background identity" >&2
+      exit 1
+    }
+    mv "$identity_destination" "$identity_backup"
+  fi
+  if ! mv "$identity_stage" "$identity_destination"; then
+    if [[ -e "$identity_backup" && ! -e "$identity_destination" ]]; then
+      mv "$identity_backup" "$identity_destination"
+    fi
+    echo "reason installer: could not install Reason's background identity" >&2
+    exit 1
+  fi
+  identity_stage=""
+  rm -rf "$identity_backup"
+  identity_backup=""
+  lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+  [[ -x "$lsregister" ]] || {
+    echo "reason installer: macOS Launch Services registration is unavailable" >&2
+    exit 1
+  }
+  # Earlier CLIs installed it as Ara/Background/Ara.app (legacy). Launch
+  # Services keeps one registration (a second lets System Settings name it
+  # "Ara"): the legacy bundle is unregistered and replaced by a bare folder
+  # holding only its executable's path, linked to Reason.app's executable, so a
+  # running worker of an earlier version keeps launching it. macOS still names
+  # that folder "Ara" in its background-activity notification, so the release's
+  # first command below removes it unless such a worker runs
+  # (retireLegacyIdentityApp). Nothing else in Application Support/Ara changes.
+  # Mirrors retireLegacyIdentityApp in cli/macos-background-identity.ts.
+  legacy_identity="$HOME/Library/Application Support/Ara/Background/Ara.app"
+  legacy_identity_link="$legacy_identity/Contents/MacOS/AraBackgroundIdentity"
+  identity_executable="ReasonBackgroundIdentity"
+  if [[ ! -f "$identity_destination/Contents/MacOS/$identity_executable" ]]; then
+    identity_executable="AraBackgroundIdentity"
+  fi
+  legacy_identity_target="../../../../../Reason/Background/Reason.app/Contents/MacOS/$identity_executable"
+  legacy_identity_id=""
+  if [[ -d "$legacy_identity" && ! -L "$legacy_identity" && -f "$legacy_identity/Contents/Info.plist" ]]; then
+    legacy_identity_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$legacy_identity/Contents/Info.plist" 2>/dev/null || true)"
+  fi
+  # Either identity bundle id, as validIdentityBundle accepts.
+  if [[ "$legacy_identity_id" == "so.ara.cli" || "$legacy_identity_id" == "com.reasonmachines.cli" ]]; then
+    "$lsregister" -u "$legacy_identity" || true
+    identity_stage="$(dirname "$legacy_identity")/.Ara.app.$$.shim"
+    identity_backup="$(dirname "$legacy_identity")/.Ara.app.$$.old"
+    rm -rf "$identity_stage" "$identity_backup"
+    mkdir -p "$identity_stage/Contents/MacOS"
+    ln -s "$legacy_identity_target" "$identity_stage/Contents/MacOS/AraBackgroundIdentity"
+    if mv "$legacy_identity" "$identity_backup"; then
+      mv "$identity_stage" "$legacy_identity" || mv "$identity_backup" "$legacy_identity"
+    fi
+    if [[ -e "$legacy_identity" ]]; then
+      rm -rf "$identity_backup"
+    fi
+    rm -rf "$identity_stage"
+    identity_stage=""
+    identity_backup=""
+  elif [[ -L "$legacy_identity_link" && ! -e "$legacy_identity/Contents/Info.plist" ]]; then
+    # Already retired: follow a Reason.app whose executable was renamed.
+    ln -sfh "$legacy_identity_target" "$legacy_identity_link"
+  fi
+  "$lsregister" -f "$identity_destination"
+fi
+
+case ":$PATH:" in
+  *":$install_dir:"*) ;;
+  *)
+    if [[ "$modify_path" == true ]]; then
+      shell_name="$(basename "${SHELL:-}")"
+      case "$shell_name" in
+        zsh) profile="${ZDOTDIR:-$HOME}/.zshrc" ;;
+        bash) profile="$HOME/.bashrc" ;;
+        *) profile="" ;;
+      esac
+      if [[ -n "$profile" ]]; then
+        touch "$profile"
+        path_line="export PATH=\"$install_dir:\$PATH\""
+        path_profile="$profile"
+        if ! grep -Fqx "$path_line" "$profile"; then
+          printf '\n# Reason CLI\n%s\n' "$path_line" >> "$profile"
+          path_added=true
+          echo "Added $install_dir to PATH in $profile; new terminals find 'reason'."
+        fi
+      fi
+    fi
+    ;;
+esac
+
+# An explicit --version/REASON_VERSION is a pin: on macOS the launcher activates
+# exactly that signed release in its managed runtime instead of the newest one.
+# Automatic updates still move it forward later (see the managed worker entry).
+# Releases older than this contract cannot honour the pin, so say so.
+installed_version="$(REASON_INSTALL_PINNED_VERSION="$pinned_version" ARA_INSTALL_PINNED_VERSION="$pinned_version" "$command_path" --version)" # LEGACY-ARA(keep): a pinned earlier release reads only the ARA_* name
+if [[ -n "$pinned_version" && "$installed_version" != "$pinned_version" ]]; then
+  echo "reason installer: warning: requested Reason $pinned_version, but this computer runs ${installed_version:-an unknown version}." >&2
+fi
+launcher_kind="file"
+if [[ "$channel" == "production" ]]; then
+  launcher_kind="symlink"
+fi
+receipt_cmd=(
+  "$command_path" "__record-installation"
+  "--channel" "$channel"
+  "--installer" "shell"
+  "--version" "$requested_version"
+  "--target" "$target"
+  "--install-dir" "$install_dir"
+  "--launcher-path" "$command_path"
+  "--launcher-kind" "$launcher_kind"
+  "--background-mode" "$background_mode"
+)
+if [[ -n "$installed_worker_root" ]]; then
+  receipt_cmd+=("--worker-root" "$installed_worker_root")
+fi
+if [[ -n "$path_profile" && -n "$path_line" ]]; then
+  receipt_cmd+=(
+    "--path-kind" "shell_profile"
+    "--path-location" "$path_profile"
+    "--path-value" "$path_line"
+  )
+  if [[ "$path_added" == true ]]; then
+    receipt_cmd+=("--path-added")
+  fi
+fi
+receipt_output="$temporary_dir/installation-receipt-output"
+if [[ "$launcher_name" == "$reason_name" ]]; then
+  # The reason layout's `ara` link is a second launcher entry (kind symlink),
+  # recorded before `reason` so an earlier install's entry keeps its place;
+  # uninstall and factory reset remove it. Not an alias: releases before
+  # 0.2.394 and the Mac app reject a receipt naming `ara` an alias of `reason`.
+  # Without --background-mode this call keeps the receipt's consent as it is.
+  if ! REASON_INSTALL_ALIAS_PATH="" ARA_INSTALL_ALIAS_PATH="" "$command_path" __record-installation \
+    --channel "$channel" --installer shell --version "$requested_version" --target "$target" \
+    --install-dir "$install_dir" --launcher-path "$install_dir/$ara_name" --launcher-kind symlink \
+    >"$receipt_output" 2>&1; then # LEGACY-ARA(keep): an inherited ARA_INSTALL_ALIAS_PATH must not reach it
+    cat "$receipt_output" >&2
+    echo "reason installer: could not record installer ownership" >&2
+    exit 1
+  fi
+fi
+if ! REASON_INSTALL_ALIAS_PATH="$created_alias_path" ARA_INSTALL_ALIAS_PATH="$created_alias_path" "${receipt_cmd[@]}" >"$receipt_output" 2>&1; then # LEGACY-ARA(keep): a pinned earlier release reads only the ARA_* name
+  if grep -Fq "Unknown command: __record-installation" "$receipt_output"; then
+    echo "reason installer: this CLI release predates ownership receipts; continuing without one." >&2
+  else
+    cat "$receipt_output" >&2
+    echo "reason installer: could not record installer ownership" >&2
+    exit 1
+  fi
+fi
+echo "✓ Installed Reason"
+
+if [[ -z "$install_upgrade" ]]; then
+  # Best-effort and silent: nothing waits for it.
+  "$command_path" __installation-telemetry installation-observed </dev/null >/dev/null 2>&1 &
+fi
+
+if [[ "$background_mode" == "future_device" || "$background_mode" == "updates_only" ]]; then
+  update_output="$temporary_dir/auto-update-output"
+  update_status=0
+  "$command_path" __auto-update install --launcher-path "$command_path" >"$update_output" 2>&1 || update_status=$?
+  if [[ "$update_status" != 0 ]]; then
+    if grep -Fq "service_program_in_temp_dir" "$update_output"; then
+      # A launcher in a temporary install dir would leave the updater pointing at a deleted file.
+      echo "reason installer: automatic updates were skipped because $command_path is in a temporary directory; install to a permanent folder (the default is ~/.local/bin) to enable them." >&2
+    elif grep -Fq "Unknown command: __auto-update" "$update_output"; then
+      echo "reason installer: this CLI release predates automatic updates; after the next release, run '$display_path update' (or '$display_path upgrade' on 0.2.31 and earlier)." >&2
+    # 3: no per-user scheduler (root, or no systemd user session: containers,
+    # WSL, CI). Releases before that code report it with these two messages.
+    elif [[ "$update_status" == 3 ]] \
+      || grep -Fq -e "Could not reload the user service manager." -e "must be installed without sudo." "$update_output"; then
+      update_reason="no systemd user session"
+      [[ "$os" != darwin ]] || update_reason="no Mac login session"
+      [[ "$(id -u)" != 0 ]] || update_reason="running as root"
+      echo "reason installer: warning: automatic updates are unavailable here ($update_reason), so Reason will not update itself; update with '$display_path upgrade' or by running this installer again." >&2
+    else
+      # The updater is not what this install is for: sign-in and connecting go on without it.
+      cat "$update_output" >&2
+      echo "reason installer: warning: automatic updates did not turn on (auto_update_install_failed), so Reason will not update itself; update with '$display_path upgrade' or by running this installer again." >&2
+    fi
+  fi
+elif [[ "$background_mode" == "cli_only" ]]; then
+  # SSH-owned installs run in a private HOME but must not boot out the user's
+  # existing updater, desktop, or CI LaunchAgents from the signed-in GUI domain.
+  if [[ "$preserve_auto_update" != 1 && "$network_chose_mode" == true ]]; then
+    # Reason Network's own background process keeps this CLI up to date (cli/network-auto-update.ts).
+    "$command_path" __auto-update remove --launcher-path "$command_path"
+  elif [[ "$preserve_auto_update" != 1 ]]; then
+    # Asked for: no automatic updates at all. A release before `decline` only removes the updater.
+    "$command_path" __auto-update decline --launcher-path "$command_path" 2>/dev/null \
+      || "$command_path" __auto-update remove --launcher-path "$command_path"
+  fi
+  echo "No Reason background process was installed."
+fi
+
+if [[ "$start_login" == true ]]; then
+  if [[ -n "$provider" ]]; then
+    login_cmd=("$command_path" "providers" "connect" "$provider")
+  else
+    login_cmd=("$command_path" "login")
+  fi
+  if [[ -n "$pairing_code" ]]; then
+    login_cmd+=("--pair" "$pairing_code")
+  fi
+  if [[ -n "$provider_account_key" ]]; then
+    login_cmd+=("--account-key" "$provider_account_key")
+  fi
+  if [[ "$auth_mode" == "loopback" ]]; then
+    login_cmd+=("--loopback")
+  fi
+fi
+# A pairing code expires within minutes and the desktop install can take
+# longer, so redeem the code first; the installer then exits with its status.
+login_status=""
+if [[ "$start_login" == true && -n "$pairing_code" && "$desktop_install" == true && "$desktop_background" != true ]]; then
+  login_status=0
+  if [[ -t 1 ]]; then
+    "${login_cmd[@]}" <&1 || login_status=$?
+  else
+    "${login_cmd[@]}" || login_status=$?
+  fi
+fi
+
+if [[ "$minimal" == true ]]; then
+  # Recorded so updates and `reason connect` keep it (cli/desktop-components.ts).
+  if "$command_path" desktop minimal >/dev/null 2>&1; then
+    echo "✓ Minimal install: files, shell and terminal ('$display_path desktop install' adds the desktop)"
+  else
+    echo "reason installer: warning: this Reason release cannot keep --minimal; after it updates, run '$display_path desktop minimal'." >&2
+  fi
+fi
+
+start_desktop_background() {
+  [[ "$desktop_background" == true ]] || return 0
+  local log_dir="$HOME/.local/share/reason"
+  mkdir -p "$log_dir"
+  # nohup: it outlives this terminal; a background job of this script already ignores Ctrl+C.
+  REASON_DESKTOP_BACKGROUND=1 nohup "$command_path" desktop install --permissions none \
+    </dev/null >"$log_dir/desktop-install.log" 2>&1 &
+  echo "  Desktop and browser use are installing in the background ('$display_path desktop status')"
+}
+
+if [[ "$desktop_install" == true && "$desktop_background" != true ]]; then
+  desktop_cmd=("$command_path" "desktop" "install" "--permissions" "$desktop_permissions")
+  desktop_output="$temporary_dir/desktop-output"
+  desktop_status=0
+  if [[ "$desktop_permissions" == none ]]; then
+    # Quiet and asks nothing: it installs what needs no password (the user-level
+    # components, and system packages as root or with passwordless sudo) and
+    # prints one line. The details, and sudo with a password, are left to
+    # `reason desktop install` and `reason desktop status`.
+    [[ ! -t 1 ]] || printf 'Setting up desktop and browser use…'
+    "${desktop_cmd[@]}" </dev/null >"$desktop_output" 2>&1 || desktop_status=$?
+    [[ ! -t 1 ]] || printf '\r\033[K'
+  else
+    # --permissions asks macOS for approvals now, with its own steps, so the
+    # step shows its output and gets the real terminal (a curl-piped
+    # installer's stdin is the rest of this script).
+    desktop_stdin=/dev/null
+    if [[ -r /dev/tty && -w /dev/tty ]] && { : </dev/tty; } 2>/dev/null; then desktop_stdin=/dev/tty; fi
+    { "${desktop_cmd[@]}" <"$desktop_stdin" 2>&1 | tee "$desktop_output"; desktop_status=${PIPESTATUS[0]}; } || true
+  fi
+  # Never fails the install: Reason itself is installed either way. Exit 3 is
+  # installed but not fully ready (cli/desktop-cli.ts).
+  if [[ "$desktop_status" == 0 ]]; then
+    echo "✓ Desktop and browser use ready"
+  elif [[ "$desktop_status" == 3 ]] && grep -Fq "(desktop_platform_unsupported)" "$desktop_output"; then
+    echo "Desktop and browser use are unavailable on this platform (desktop_platform_unsupported)."
+  elif [[ "$desktop_status" == 3 ]]; then
+    echo "Desktop and browser use need more setup: run '$display_path desktop install' when you want them."
+  else
+    [[ "$desktop_permissions" != none ]] || tail -n 1 "$desktop_output" >&2
+    echo "reason installer: warning: desktop and browser use did not install (desktop_install_failed); Reason itself is installed. Retry with '$display_path desktop install'." >&2
+  fi
+fi
+
+[[ "$network" != true ]] || run_network "$command_path"
+
+if [[ -n "$serve_token" ]]; then
+  serve_cmd=("$command_path" "serve")
+  if [[ -n "$serve_dir" ]]; then
+    serve_cmd+=("--dir" "$serve_dir")
+  fi
+  if [[ "$serve_once" == true ]]; then
+    serve_cmd+=("--once")
+  fi
+  if [[ "$serve_service" == true ]]; then
+    serve_cmd+=("--service")
+  fi
+  echo
+  echo "This computer will join the token's Machine as a worker."
+  echo "  Folder: ${serve_dir:-$PWD}"
+  if [[ "$serve_once" == true ]]; then
+    echo "  Takes one session, then exits."
+  fi
+  if [[ "$serve_service" == true ]]; then
+    echo "It then keeps running as a background service; '$display_path stop NAME' stops and removes it."
+  else
+    echo "Ctrl+C to stop. Run '$display_path serve' to reconnect later."
+  fi
+  export REASON_TOKEN="$serve_token"
+  # A curl-piped installer's stdin is the rest of this script; the worker is
+  # non-interactive with a token, so give it no stdin rather than that pipe.
+  exec "${serve_cmd[@]}" </dev/null
+fi
+
+if [[ "$connect_worker" == true && "$start_login" == true ]]; then
+  # Sign in with the pairing code (unless the desktop install already did),
+  # then connect this computer as the person's own worker. Nothing is asked.
+  if [[ -z "$login_status" ]]; then
+    login_status=0
+    if [[ -t 1 ]]; then "${login_cmd[@]}" <&1 || login_status=$?; else "${login_cmd[@]}" || login_status=$?; fi
+  fi
+  [[ "$login_status" == 0 ]] || exit "$login_status"
+  # --yes: a release from before connecting stopped asking still needs it without a terminal.
+  # REASON_INSTALLER: where no service manager runs, connect names the command
+  # that keeps the connection running instead of holding this installer open.
+  if [[ "$desktop_background" != true ]] && [[ "$open_after_connect" != true || ! -t 1 ]]; then
+    REASON_INSTALLER=1 exec "$command_path" connect --yes </dev/null
+  fi
+  connect_status=0
+  REASON_INSTALLER=1 "$command_path" connect --yes </dev/null || connect_status=$?
+  # The desktop profile is wanted connected or not; a later `reason connect` serves it.
+  start_desktop_background
+  [[ "$connect_status" == 0 ]] || exit "$connect_status"
+  [[ "$open_after_connect" == true && -t 1 ]] || exit 0
+  # --open: the onboarding command lands in a session; keys come from the
+  # terminal it writes to, as for a plain install (see below).
+  echo
+  exec "$command_path" <&1
+elif [[ -n "$login_status" ]]; then
+  # Signed in with the pairing code before the desktop install.
+  exit "$login_status"
+elif [[ "$start_login" == true ]]; then
+  start_desktop_background
+  # curl-piped installers have already consumed stdin; give sign-in the keyboard.
+  # The terminal's own descriptor, not /dev/tty: on macOS that alias cannot be
+  # polled, so a command reading it never sees a key.
+  if [[ -t 1 ]]; then
+    exec "${login_cmd[@]}" <&1
+  fi
+  exec "${login_cmd[@]}"
+elif [[ "$open_reason" == true && -t 1 ]]; then
+  start_desktop_background
+  # `reason` signs in when needed, then opens a session. The piped installer
+  # has consumed stdin, so it reads keys from the terminal it writes to (see above).
+  echo
+  exec "$command_path" <&1
+else
+  start_desktop_background
+  echo "Next: $display_path"
+fi
