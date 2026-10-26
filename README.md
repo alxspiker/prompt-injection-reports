@@ -14,6 +14,7 @@ Agents now read web pages and tool output and then act on them: they click, pay,
 
 ## Contribute
 See [CONTRIBUTING.md](CONTRIBUTING.md). Start from [`reports/_TEMPLATE/REPORT.md`](reports/_TEMPLATE/REPORT.md).
+No time for a full report? [Open a finding issue](https://github.com/alxspiker/prompt-injection-reports/issues/new?template=finding.yml) with the URL, what you saw, and redacted screenshots.
 
 ## License
 Written content is [CC BY 4.0](LICENSE). Captured third-party material in `evidence/` and `bundles/` folders belongs to its owners and is included for research and commentary.

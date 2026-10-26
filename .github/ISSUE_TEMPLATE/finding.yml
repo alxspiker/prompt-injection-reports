@@ -1,0 +1,54 @@
+name: Report a finding
+description: Report a page, tool, or service that plants instructions for AI agents. No PR needed.
+title: "Finding: <site> <short description>"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. It will be looked into and may be written up as a full report, with credit.
+        **Observe, don't exploit.** Don't follow the injected instructions.
+        **Redact before posting.** This issue is public. Remove names, emails, addresses, session IDs, tokens, cookies, and account details from text and screenshots.
+  - type: input
+    id: url
+    attributes:
+      label: URL
+      description: Where you found it. Strip session or tracking parameters.
+      placeholder: https://example.com/checkout
+    validations:
+      required: true
+  - type: textarea
+    id: location
+    attributes:
+      label: Where on the page / what kind of trap
+      description: e.g. hidden div in checkout, HTML comment, llms.txt, meta tag, tool description, onboarding text.
+    validations:
+      required: false
+  - type: textarea
+    id: observed
+    attributes:
+      label: What you saw
+      description: Describe it, and paste the agent-directed text verbatim.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Screenshots / evidence
+      description: Drag in redacted screenshots, or paste HTML/CSS/JS excerpts or headers.
+    validations:
+      required: false
+  - type: input
+    id: date
+    attributes:
+      label: Date observed
+      placeholder: YYYY-MM-DD
+    validations:
+      required: false
+  - type: checkboxes
+    id: redaction
+    attributes:
+      label: Redaction
+      options:
+        - label: I removed personal data (names, emails, addresses, session IDs, tokens, cookies, account details) from the text and screenshots above.
+          required: true
